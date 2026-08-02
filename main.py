@@ -81,18 +81,27 @@ def parse_bms_url(url: str):
     match_event = re.search(r'(ET\d+)', url)
     event_code = match_event.group(1) if match_event else None
 
-    parts = url.split('/')
-    region_code = "CHEN"  # Default
+    region_code = "CHEN"  # Default to Chennai
+    parts = url.lower().split('/')
     if "movies" in parts:
         idx = parts.index("movies")
         if idx + 1 < len(parts):
-            region_code = parts[idx + 1].upper()[:4]
+            extracted = parts[idx + 1].upper()
+            city_map = {
+                "CHENNAI": "CHEN",
+                "BANGALORE": "BANG",
+                "BENGALURU": "BANG",
+                "MUMBAI": "MUMB",
+                "DELHI-NCR": "NCR",
+                "HYDERABAD": "HYD"
+            }
+            region_code = city_map.get(extracted, extracted[:4])
 
     return event_code, region_code
 
 
 def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filter: str, time_filter: str):
-    """Hits BookMyShow's API endpoints using modern browser headers to avoid 403 blocks."""
+    """Hits BookMyShow's API endpoints using full browser signatures."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -118,47 +127,52 @@ def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filt
         req = urllib.request.Request(api_url, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=15) as response:
-                data = json.loads(response.read().decode("utf-8"))
+                raw_response = response.read().decode("utf-8")
+                data = json.loads(raw_response)
                 
-                # Parse BookMyShow json structure
-                if "BookMyShow" in data and "arrVenue" in data["BookMyShow"]:
-                    venues = data["BookMyShow"]["arrVenue"]
-                    for venue in venues:
-                        venue_name = venue.get("VenueName", "")
+                venues = []
+                if isinstance(data, dict):
+                    if "BookMyShow" in data and "arrVenue" in data["BookMyShow"]:
+                        venues = data["BookMyShow"]["arrVenue"]
+                    elif "arrVenue" in data:
+                        venues = data["arrVenue"]
+
+                print(f"DEBUG [{date_str}]: Retrieved {len(venues)} venues from BMS API.")
+
+                for venue in venues:
+                    venue_name = venue.get("VenueName", "")
+                    
+                    if theatre_filter and not any(t.strip().lower() in venue_name.lower() for t in theatre_filter.split(',')):
+                        continue
+
+                    for show in venue.get("ShowTimes", []):
+                        show_time = show.get("ShowTime", "")
                         
-                        # Apply theatre filter if specified
-                        if theatre_filter and not any(t.strip().lower() in venue_name.lower() for t in theatre_filter.split(',')):
-                            continue
+                        if time_filter:
+                            hour = int(show.get("ShowTimeCode", "0")[:2]) if show.get("ShowTimeCode") else 12
+                            match_time = False
+                            for t_cond in time_filter.split(','):
+                                t_cond = t_cond.strip().lower()
+                                if t_cond == "morning" and 6 <= hour < 12: match_time = True
+                                elif t_cond == "afternoon" and 12 <= hour < 16: match_time = True
+                                elif t_cond == "evening" and 16 <= hour < 19: match_time = True
+                                elif t_cond == "night" and (19 <= hour <= 24 or hour < 6): match_time = True
+                            if not match_time:
+                                continue
 
-                        for show in venue.get("ShowTimes", []):
-                            show_time = show.get("ShowTime", "")
-                            
-                            # Filter by time period if specified (morning, afternoon, evening, night)
-                            if time_filter:
-                                hour = int(show.get("ShowTimeCode", "0")[:2]) if show.get("ShowTimeCode") else 12
-                                match_time = False
-                                for t_cond in time_filter.split(','):
-                                    t_cond = t_cond.strip().lower()
-                                    if t_cond == "morning" and 6 <= hour < 12: match_time = True
-                                    elif t_cond == "afternoon" and 12 <= hour < 16: match_time = True
-                                    elif t_cond == "evening" and 16 <= hour < 19: match_time = True
-                                    elif t_cond == "night" and (19 <= hour <= 24 or hour < 6): match_time = True
-                                if not match_time:
-                                    continue
+                        categories = [cat.get("Price", "") for cat in show.get("Categories", [])]
+                        price_info = f"₹{categories[0]}" if categories else ""
 
-                            categories = [cat.get("Price", "") for cat in show.get("Categories", [])]
-                            price_info = f"₹{categories[0]}" if categories else ""
-
-                            all_shows.append({
-                                "id": f"{venue_name}_{date_str}_{show_time}",
-                                "venue": venue_name,
-                                "date": date_str,
-                                "time": show_time,
-                                "price": price_info,
-                                "status": show.get("ShowBookingOptions", "Available")
-                            })
+                        all_shows.append({
+                            "id": f"{venue_name}_{date_str}_{show_time}",
+                            "venue": venue_name,
+                            "date": date_str,
+                            "time": show_time,
+                            "price": price_info,
+                            "status": show.get("ShowBookingOptions", "Available")
+                        })
         except Exception as e:
-            print(f"Error fetching data for date {date_str}: {e}")
+            print(f"❌ Error fetching data for date {date_str}: {e}")
 
     return all_shows
 
@@ -196,8 +210,11 @@ def main():
 
     event_code, region_code = parse_bms_url(bms_url)
     
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] BMS Ticket Checker - CI mode")
-    print(f"Event: {event_code}  Region: {region_code}  Dates: {dates}")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] BMS Ticket Checker")
+    print(f"URL: {bms_url}")
+    print(f"Extracted Event Code: {event_code} | Region Code: {region_code}")
+    print(f"Monitoring Dates: {dates}")
+    print(f"Filters -> Theatre: '{theatre_filter}' | Time: '{time_filter}'")
 
     current_shows = fetch_showtimes(event_code, region_code, dates, theatre_filter, time_filter)
     previous_state = load_state()
@@ -217,25 +234,42 @@ def main():
 
     # Dispatch Telegram Notifications
     if current_shows:
+        # Group showtimes by venue (Theatre Name)
+        venues_summary = {}
+        for show in current_shows:
+            venue = show["venue"]
+            time_str = f"{show['time']} ({show['date']})"
+            if venue not in venues_summary:
+                venues_summary[venue] = []
+            venues_summary[venue].append(time_str)
+
+        # Build detailed theatre & timings text block
+        theatre_details = []
+        for venue_name, times in venues_summary.items():
+            theatre_details.append(f"🏛️ <b>{venue_name}</b>\n   🕒 {', '.join(times)}")
+        
+        shows_text_block = "\n\n".join(theatre_details)
+
         if changes:
             message_lines = [
-                "<b>🎟️ BOOKMYSHOW ALERT: TICKETS / SHOWTIMES UPDATED!</b>\n",
-                f"<b>Movie/Event:</b> {event_code}",
+                "<b>🎟️ BOOKMYSHOW ALERT: NEW SHOWS DETECTED!</b>\n",
+                f"<b>Movie Code:</b> {event_code}",
                 f"<b>Total Shows Found:</b> {len(current_shows)}\n",
-                "<b>Changes Detected:</b>"
+                "<b>Available Theatres & Timings:</b>\n",
+                shows_text_block,
+                f"\n🔗 <a href='{bms_url}'>Book on BookMyShow</a>"
             ]
-            for change in changes:
-                message_lines.append(f"• {change}")
-            
-            message_lines.append(f"\n🔗 <a href='{bms_url}'>Book on BookMyShow</a>")
             send_telegram_notification("\n".join(message_lines))
         else:
-            send_telegram_notification(
-                f"<b>ℹ️ BMS Hourly Status Check:</b>\n\n"
-                f"• <b>Status:</b> Showtimes Active ({len(current_shows)} found)\n"
-                f"• <b>Changes:</b> No new shows or seat updates detected.\n"
-                f"• <b>Monitored Dates:</b> {', '.join(dates)}"
-            )
+            message_lines = [
+                "<b>ℹ️ BMS Hourly Status Check: Active Shows</b>\n",
+                f"<b>Movie Code:</b> {event_code}",
+                f"<b>Total Shows Found:</b> {len(current_shows)}\n",
+                "<b>Theatres & Timings:</b>\n",
+                shows_text_block,
+                f"\n🔗 <a href='{bms_url}'>Book on BookMyShow</a>"
+            ]
+            send_telegram_notification("\n".join(message_lines))
     else:
         send_telegram_notification(
             f"<b>❌ BMS Hourly Status Check:</b>\n\n"
