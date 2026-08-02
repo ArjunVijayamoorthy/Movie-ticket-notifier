@@ -92,12 +92,19 @@ def parse_bms_url(url: str):
 
 
 def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filter: str, time_filter: str):
-    """Hits BookMyShow's API endpoints for showtime details."""
+    """Hits BookMyShow's API endpoints using modern browser headers to avoid 403 blocks."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Origin": "https://in.bookmyshow.com",
-        "Referer": "https://in.bookmyshow.com/"
+        "Referer": f"https://in.bookmyshow.com/buytickets/{event_code}",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin"
     }
 
     all_shows = []
