@@ -2,17 +2,22 @@ name: BMS Ticket Checker
 
 on:
   schedule:
-    # Runs at the start of every hour
+    # Runs at the start of every hour (e.g., 1:00, 2:00, 3:00)
     - cron: '0 * * * *'
   
+  # Allows manual triggering from the Actions tab
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   check-tickets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
       - name: Install uv
         uses: astral-sh/setup-uv@v3
 
@@ -23,13 +28,15 @@ jobs:
 
       - name: Generate Dynamic Dates
         run: |
-          # Automatically generates YYYYMMDD for Today, Tomorrow, and Day After in IST
+          # Automatically generates YYYYMMDD for Today, Tomorrow, and Day After in IST timezone
           TODAY=$(TZ='Asia/Kolkata' date +%Y%m%d)
           TOMORROW=$(TZ='Asia/Kolkata' date -d "+1 day" +%Y%m%d)
           DAY_AFTER=$(TZ='Asia/Kolkata' date -d "+2 days" +%Y%m%d)
+          
+          # Sets BMS_DATES environment variable for main.py
           echo "BMS_DATES=${TODAY},${TOMORROW},${DAY_AFTER}" >> $GITHUB_ENV
 
-      - name: Run ticket check
+      - name: Run Ticket Check
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           RESEND_FROM_EMAIL: ${{ secrets.RESEND_FROM_EMAIL }}
@@ -40,3 +47,11 @@ jobs:
           BMS_THEATRE: ${{ vars.BMS_THEATRE }}
           BMS_TIME: ${{ vars.BMS_TIME }}
         run: uv run main.py
+
+      - name: Commit State Changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bms_state.json
+          git commit -m "Update BMS state [skip ci]" || exit 0
+          git push
