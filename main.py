@@ -1,8 +1,10 @@
 import json
 import os
 import re
+import time
 import urllib.parse
 import urllib.request
+import http.cookiejar
 from datetime import datetime
 
 # ==========================================
@@ -67,14 +69,19 @@ def parse_bms_url(url: str):
 
 
 def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filter: str, time_filter: str):
-    """Hits BookMyShow's API endpoints using full browser signatures to bypass WAF 403 blocks."""
+    """Hits BookMyShow API with cookie persistence and request pacing to pass WAF checks."""
+    
+    # Set up cookie handler for session persistence
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
         "Origin": "https://in.bookmyshow.com",
         "Referer": f"https://in.bookmyshow.com/buytickets/{event_code}",
-        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua": '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Windows"',
         "Sec-Fetch-Dest": "empty",
@@ -88,12 +95,21 @@ def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filt
         if not date_str:
             continue
 
+        # Short delay between dates to prevent rate-limit triggers
+        time.sleep(0.6)
+
         api_url = f"https://in.bookmyshow.com/serv/getData?cmd=GETSHOWTIMESBYEVENTANDDATE&f=json&dc={date_str}&vc={region_code}&eid={event_code}"
         
         req = urllib.request.Request(api_url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=15) as response:
+            with opener.open(req, timeout=15) as response:
                 raw_response = response.read().decode("utf-8")
+                
+                # Check if the response is JSON or an HTML WAF block page
+                if not raw_response.strip().startswith("{") and not raw_response.strip().startswith("["):
+                    print(f"⚠️ [{date_str}]: BMS returned non-JSON response (WAF challenge or no shows).")
+                    continue
+
                 data = json.loads(raw_response)
                 
                 venues = []
@@ -137,6 +153,8 @@ def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filt
                             "price": price_info,
                             "status": show.get("ShowBookingOptions", "Available")
                         })
+        except urllib.error.HTTPError as e:
+            print(f"❌ Error fetching data for date {date_str}: HTTP {e.code} {e.reason}")
         except Exception as e:
             print(f"❌ Error fetching data for date {date_str}: {e}")
 
@@ -246,7 +264,6 @@ def main():
             ]
             send_telegram_notification("\n".join(message_lines))
     else:
-        # Silent mode when 0 shows are available (prevents hourly Telegram spam)
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] No showtimes available for monitored dates. Telegram alert skipped.")
 
 
