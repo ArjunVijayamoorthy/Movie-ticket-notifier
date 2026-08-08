@@ -1,11 +1,15 @@
+# /// script
+# dependencies = [
+#     "curl-cffi",
+# ]
+# ///
+
 import json
 import os
 import re
 import time
-import urllib.parse
-import urllib.request
-import http.cookiejar
 from datetime import datetime
+from curl_cffi import requests
 
 # ==========================================
 # 1. HELPER FUNCTIONS FOR NOTIFICATIONS
@@ -27,15 +31,17 @@ def send_telegram_notification(text: str):
         "parse_mode": "HTML"
     }
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"}
-    )
-
     try:
-        with urllib.request.urlopen(req):
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        if response.status_code == 200:
             print("⚡ Telegram alert sent successfully!")
+        else:
+            print(f"❌ Telegram API Error: {response.status_code} {response.text}")
     except Exception as e:
         print(f"❌ Failed to send Telegram notification: {e}")
 
@@ -69,18 +75,17 @@ def parse_bms_url(url: str):
 
 
 def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filter: str, time_filter: str):
-    """Hits BookMyShow API with cookie persistence, exponential backoff, and request pacing."""
+    """Hits BookMyShow API using TLS Browser Impersonation via curl_cffi."""
     
-    cj = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    # Create an impersonated Chrome TLS session
+    session = requests.Session(impersonate="chrome120")
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
         "Origin": "https://in.bookmyshow.com",
         "Referer": f"https://in.bookmyshow.com/buytickets/{event_code}",
-        "Sec-Ch-Ua": '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+        "Sec-Ch-Ua": '"Not/A)Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Windows"',
         "Sec-Fetch-Dest": "empty",
@@ -94,77 +99,80 @@ def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filt
         if not date_str:
             continue
 
-        # Safe request pacing (1.5 seconds between date calls)
         if idx > 0:
-            time.sleep(1.5)
+            time.sleep(1.2)
 
         api_url = f"https://in.bookmyshow.com/serv/getData?cmd=GETSHOWTIMESBYEVENTANDDATE&f=json&dc={date_str}&vc={region_code}&eid={event_code}"
         
-        req = urllib.request.Request(api_url, headers=headers)
-        
-        # Retry loop for HTTP 429 rate limits
         max_retries = 2
         for attempt in range(max_retries + 1):
             try:
-                with opener.open(req, timeout=15) as response:
-                    raw_response = response.read().decode("utf-8")
-                    
-                    if not raw_response.strip().startswith("{") and not raw_response.strip().startswith("["):
-                        print(f"⚠️ [{date_str}]: BMS returned non-JSON response (WAF challenge or no shows).")
+                response = session.get(api_url, headers=headers, timeout=15)
+                
+                if response.status_code == 429:
+                    if attempt < max_retries:
+                        print(f"⏳ [{date_str}]: HTTP 429 Rate limited. Retrying in 4 seconds...")
+                        time.sleep(4)
+                        continue
+                    else:
+                        print(f"❌ Error fetching data for date {date_str}: HTTP 429 Rate Limited")
                         break
 
-                    data = json.loads(raw_response)
-                    
-                    venues = []
-                    if isinstance(data, dict):
-                        if "BookMyShow" in data and "arrVenue" in data["BookMyShow"]:
-                            venues = data["BookMyShow"]["arrVenue"]
-                        elif "arrVenue" in data:
-                            venues = data["arrVenue"]
-
-                    print(f"DEBUG [{date_str}]: Retrieved {len(venues)} venues from BMS API.")
-
-                    for venue in venues:
-                        venue_name = venue.get("VenueName", "")
-                        
-                        if theatre_filter and not any(t.strip().lower() in venue_name.lower() for t in theatre_filter.split(',')):
-                            continue
-
-                        for show in venue.get("ShowTimes", []):
-                            show_time = show.get("ShowTime", "")
-                            
-                            if time_filter:
-                                hour = int(show.get("ShowTimeCode", "0")[:2]) if show.get("ShowTimeCode") else 12
-                                match_time = False
-                                for t_cond in time_filter.split(','):
-                                    t_cond = t_cond.strip().lower()
-                                    if t_cond == "morning" and 6 <= hour < 12: match_time = True
-                                    elif t_cond == "afternoon" and 12 <= hour < 16: match_time = True
-                                    elif t_cond == "evening" and 16 <= hour < 19: match_time = True
-                                    elif t_cond == "night" and (19 <= hour <= 24 or hour < 6): match_time = True
-                                if not match_time:
-                                    continue
-
-                            categories = [cat.get("Price", "") for cat in show.get("Categories", [])]
-                            price_info = f"₹{categories[0]}" if categories else ""
-
-                            all_shows.append({
-                                "id": f"{venue_name}_{date_str}_{show_time}",
-                                "venue": venue_name,
-                                "date": date_str,
-                                "time": show_time,
-                                "price": price_info,
-                                "status": show.get("ShowBookingOptions", "Available")
-                            })
-                    break  # Success break out of retry loop
-
-            except urllib.error.HTTPError as e:
-                if e.code == 429 and attempt < max_retries:
-                    print(f"⏳ [{date_str}]: HTTP 429 Rate limited. Retrying in 5 seconds...")
-                    time.sleep(5)
-                else:
-                    print(f"❌ Error fetching data for date {date_str}: HTTP {e.code} {e.reason}")
+                if response.status_code != 200:
+                    print(f"❌ Error fetching data for date {date_str}: HTTP {response.status_code}")
                     break
+
+                raw_response = response.text.strip()
+                
+                if not (raw_response.startswith("{") or raw_response.startswith("[")):
+                    print(f"⚠️ [{date_str}]: BMS returned non-JSON response (WAF block or page redirect).")
+                    break
+
+                data = json.loads(raw_response)
+                
+                venues = []
+                if isinstance(data, dict):
+                    if "BookMyShow" in data and "arrVenue" in data["BookMyShow"]:
+                        venues = data["BookMyShow"]["arrVenue"]
+                    elif "arrVenue" in data:
+                        venues = data["arrVenue"]
+
+                print(f"DEBUG [{date_str}]: Retrieved {len(venues)} venues from BMS API.")
+
+                for venue in venues:
+                    venue_name = venue.get("VenueName", "")
+                    
+                    if theatre_filter and not any(t.strip().lower() in venue_name.lower() for t in theatre_filter.split(',')):
+                        continue
+
+                    for show in venue.get("ShowTimes", []):
+                        show_time = show.get("ShowTime", "")
+                        
+                        if time_filter:
+                            hour = int(show.get("ShowTimeCode", "0")[:2]) if show.get("ShowTimeCode") else 12
+                            match_time = False
+                            for t_cond in time_filter.split(','):
+                                t_cond = t_cond.strip().lower()
+                                if t_cond == "morning" and 6 <= hour < 12: match_time = True
+                                elif t_cond == "afternoon" and 12 <= hour < 16: match_time = True
+                                elif t_cond == "evening" and 16 <= hour < 19: match_time = True
+                                elif t_cond == "night" and (19 <= hour <= 24 or hour < 6): match_time = True
+                            if not match_time:
+                                continue
+
+                        categories = [cat.get("Price", "") for cat in show.get("Categories", [])]
+                        price_info = f"₹{categories[0]}" if categories else ""
+
+                        all_shows.append({
+                            "id": f"{venue_name}_{date_str}_{show_time}",
+                            "venue": venue_name,
+                            "date": date_str,
+                            "time": show_time,
+                            "price": price_info,
+                            "status": show.get("ShowBookingOptions", "Available")
+                        })
+                break
+
             except Exception as e:
                 print(f"❌ Error fetching data for date {date_str}: {e}")
                 break
@@ -205,7 +213,6 @@ def main():
 
     is_imax = "imax" in theatre_filter.lower()
 
-    # Cap at 14 days maximum to stay below BMS request rate-limits per execution
     if is_imax:
         dates = all_dates[:14]
         print("🎬 IMAX detected in BMS_THEATRE! Scanning 14-day window.")
