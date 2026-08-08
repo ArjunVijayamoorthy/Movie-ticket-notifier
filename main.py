@@ -101,7 +101,7 @@ def parse_bms_url(url: str):
 
 
 def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filter: str, time_filter: str):
-    """Hits BookMyShow's API endpoints using full browser signatures."""
+    """Hits BookMyShow's API endpoints using full browser signatures to bypass WAF 403 blocks."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -271,11 +271,8 @@ def main():
             ]
             send_telegram_notification("\n".join(message_lines))
     else:
-        send_telegram_notification(
-            f"<b>❌ BMS Hourly Status Check:</b>\n\n"
-            f"• <b>Status:</b> No showtimes or tickets are currently available.\n"
-            f"• <b>Monitored Dates:</b> {', '.join(dates)}"
-        )
+        # Silent mode when 0 shows are available (prevents hourly Telegram spam)
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] No showtimes available for dates: {', '.join(dates)}. Telegram alert skipped.")
 
 
 if __name__ == "__main__":
