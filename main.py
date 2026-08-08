@@ -38,40 +38,6 @@ def send_telegram_notification(text: str):
         print(f"❌ Failed to send Telegram notification: {e}")
 
 
-def send_email_notification(subject: str, html_content: str):
-    """Sends HTML email notifications via Resend (Optional backup)."""
-    api_key = os.getenv("RESEND_API_KEY")
-    from_email = os.getenv("RESEND_FROM_EMAIL")
-    to_email = os.getenv("RESEND_TO_EMAIL")
-
-    if not api_key or not from_email or not to_email:
-        print("⚠️ Resend credentials missing. Skipping email notification.")
-        return
-
-    url = "https://api.resend.com/emails"
-    payload = {
-        "from": from_email,
-        "to": [to_email],
-        "subject": subject,
-        "html": html_content
-    }
-
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-    )
-
-    try:
-        with urllib.request.urlopen(req):
-            print("📧 Resend Email sent successfully!")
-    except Exception as e:
-        print(f"❌ Failed to send Resend email: {e}")
-
-
 # ==========================================
 # 2. BOOKMYSHOW DATA SCRAPING & PARSING
 # ==========================================
@@ -203,17 +169,28 @@ def main():
         return
 
     dates_var = os.getenv("BMS_DATES", "")
-    dates = [d.strip() for d in dates_var.split(",") if d.strip()]
+    all_dates = [d.strip() for d in dates_var.split(",") if d.strip()]
     
     theatre_filter = os.getenv("BMS_THEATRE", "")
     time_filter = os.getenv("BMS_TIME", "")
+
+    # Check if we are monitoring IMAX theaters specifically
+    is_imax = "imax" in theatre_filter.lower()
+
+    # Apply 35-day window for IMAX, otherwise restrict to 7 days for normal theaters
+    if is_imax:
+        dates = all_dates  # Up to 35 days
+        print("🎬 IMAX detected in BMS_THEATRE! Scanning full 35-day window.")
+    else:
+        dates = all_dates[:7]  # Restrict to first 7 days
+        print("🎟️ Standard theater mode. Scanning 7-day window.")
 
     event_code, region_code = parse_bms_url(bms_url)
     
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] BMS Ticket Checker")
     print(f"URL: {bms_url}")
     print(f"Extracted Event Code: {event_code} | Region Code: {region_code}")
-    print(f"Monitoring Dates: {dates}")
+    print(f"Monitoring Dates Count: {len(dates)} dates ({dates[0]} to {dates[-1]})")
     print(f"Filters -> Theatre: '{theatre_filter}' | Time: '{time_filter}'")
 
     current_shows = fetch_showtimes(event_code, region_code, dates, theatre_filter, time_filter)
@@ -234,7 +211,6 @@ def main():
 
     # Dispatch Telegram Notifications
     if current_shows:
-        # Group showtimes by venue (Theatre Name)
         venues_summary = {}
         for show in current_shows:
             venue = show["venue"]
@@ -243,7 +219,6 @@ def main():
                 venues_summary[venue] = []
             venues_summary[venue].append(time_str)
 
-        # Build detailed theatre & timings text block
         theatre_details = []
         for venue_name, times in venues_summary.items():
             theatre_details.append(f"🏛️ <b>{venue_name}</b>\n   🕒 {', '.join(times)}")
@@ -272,7 +247,7 @@ def main():
             send_telegram_notification("\n".join(message_lines))
     else:
         # Silent mode when 0 shows are available (prevents hourly Telegram spam)
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] No showtimes available for dates: {', '.join(dates)}. Telegram alert skipped.")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] No showtimes available for monitored dates. Telegram alert skipped.")
 
 
 if __name__ == "__main__":
