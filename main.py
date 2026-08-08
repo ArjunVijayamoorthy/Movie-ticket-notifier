@@ -69,9 +69,8 @@ def parse_bms_url(url: str):
 
 
 def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filter: str, time_filter: str):
-    """Hits BookMyShow API with cookie persistence and request pacing to pass WAF checks."""
+    """Hits BookMyShow API with cookie persistence, exponential backoff, and request pacing."""
     
-    # Set up cookie handler for session persistence
     cj = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
 
@@ -91,72 +90,84 @@ def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filt
 
     all_shows = []
     
-    for date_str in dates:
+    for idx, date_str in enumerate(dates):
         if not date_str:
             continue
 
-        # Short delay between dates to prevent rate-limit triggers
-        time.sleep(0.6)
+        # Safe request pacing (1.5 seconds between date calls)
+        if idx > 0:
+            time.sleep(1.5)
 
         api_url = f"https://in.bookmyshow.com/serv/getData?cmd=GETSHOWTIMESBYEVENTANDDATE&f=json&dc={date_str}&vc={region_code}&eid={event_code}"
         
         req = urllib.request.Request(api_url, headers=headers)
-        try:
-            with opener.open(req, timeout=15) as response:
-                raw_response = response.read().decode("utf-8")
-                
-                # Check if the response is JSON or an HTML WAF block page
-                if not raw_response.strip().startswith("{") and not raw_response.strip().startswith("["):
-                    print(f"⚠️ [{date_str}]: BMS returned non-JSON response (WAF challenge or no shows).")
-                    continue
-
-                data = json.loads(raw_response)
-                
-                venues = []
-                if isinstance(data, dict):
-                    if "BookMyShow" in data and "arrVenue" in data["BookMyShow"]:
-                        venues = data["BookMyShow"]["arrVenue"]
-                    elif "arrVenue" in data:
-                        venues = data["arrVenue"]
-
-                print(f"DEBUG [{date_str}]: Retrieved {len(venues)} venues from BMS API.")
-
-                for venue in venues:
-                    venue_name = venue.get("VenueName", "")
+        
+        # Retry loop for HTTP 429 rate limits
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                with opener.open(req, timeout=15) as response:
+                    raw_response = response.read().decode("utf-8")
                     
-                    if theatre_filter and not any(t.strip().lower() in venue_name.lower() for t in theatre_filter.split(',')):
-                        continue
+                    if not raw_response.strip().startswith("{") and not raw_response.strip().startswith("["):
+                        print(f"⚠️ [{date_str}]: BMS returned non-JSON response (WAF challenge or no shows).")
+                        break
 
-                    for show in venue.get("ShowTimes", []):
-                        show_time = show.get("ShowTime", "")
+                    data = json.loads(raw_response)
+                    
+                    venues = []
+                    if isinstance(data, dict):
+                        if "BookMyShow" in data and "arrVenue" in data["BookMyShow"]:
+                            venues = data["BookMyShow"]["arrVenue"]
+                        elif "arrVenue" in data:
+                            venues = data["arrVenue"]
+
+                    print(f"DEBUG [{date_str}]: Retrieved {len(venues)} venues from BMS API.")
+
+                    for venue in venues:
+                        venue_name = venue.get("VenueName", "")
                         
-                        if time_filter:
-                            hour = int(show.get("ShowTimeCode", "0")[:2]) if show.get("ShowTimeCode") else 12
-                            match_time = False
-                            for t_cond in time_filter.split(','):
-                                t_cond = t_cond.strip().lower()
-                                if t_cond == "morning" and 6 <= hour < 12: match_time = True
-                                elif t_cond == "afternoon" and 12 <= hour < 16: match_time = True
-                                elif t_cond == "evening" and 16 <= hour < 19: match_time = True
-                                elif t_cond == "night" and (19 <= hour <= 24 or hour < 6): match_time = True
-                            if not match_time:
-                                continue
+                        if theatre_filter and not any(t.strip().lower() in venue_name.lower() for t in theatre_filter.split(',')):
+                            continue
 
-                        categories = [cat.get("Price", "") for cat in show.get("Categories", [])]
-                        price_info = f"₹{categories[0]}" if categories else ""
+                        for show in venue.get("ShowTimes", []):
+                            show_time = show.get("ShowTime", "")
+                            
+                            if time_filter:
+                                hour = int(show.get("ShowTimeCode", "0")[:2]) if show.get("ShowTimeCode") else 12
+                                match_time = False
+                                for t_cond in time_filter.split(','):
+                                    t_cond = t_cond.strip().lower()
+                                    if t_cond == "morning" and 6 <= hour < 12: match_time = True
+                                    elif t_cond == "afternoon" and 12 <= hour < 16: match_time = True
+                                    elif t_cond == "evening" and 16 <= hour < 19: match_time = True
+                                    elif t_cond == "night" and (19 <= hour <= 24 or hour < 6): match_time = True
+                                if not match_time:
+                                    continue
 
-                        all_shows.append({
-                            "id": f"{venue_name}_{date_str}_{show_time}",
-                            "venue": venue_name,
-                            "date": date_str,
-                            "time": show_time,
-                            "price": price_info,
-                            "status": show.get("ShowBookingOptions", "Available")
-                        })
-        except urllib.error.HTTPError as e:
-            print(f"❌ Error fetching data for date {date_str}: HTTP {e.code} {e.reason}")
-        except Exception as e:
-            print(f"❌ Error fetching data for date {date_str}: {e}")
+                            categories = [cat.get("Price", "") for cat in show.get("Categories", [])]
+                            price_info = f"₹{categories[0]}" if categories else ""
+
+                            all_shows.append({
+                                "id": f"{venue_name}_{date_str}_{show_time}",
+                                "venue": venue_name,
+                                "date": date_str,
+                                "time": show_time,
+                                "price": price_info,
+                                "status": show.get("ShowBookingOptions", "Available")
+                            })
+                    break  # Success break out of retry loop
+
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < max_retries:
+                    print(f"⏳ [{date_str}]: HTTP 429 Rate limited. Retrying in 5 seconds...")
+                    time.sleep(5)
+                else:
+                    print(f"❌ Error fetching data for date {date_str}: HTTP {e.code} {e.reason}")
+                    break
+            except Exception as e:
+                print(f"❌ Error fetching data for date {date_str}: {e}")
+                break
 
     return all_shows
 
@@ -192,15 +203,14 @@ def main():
     theatre_filter = os.getenv("BMS_THEATRE", "")
     time_filter = os.getenv("BMS_TIME", "")
 
-    # Check if we are monitoring IMAX theaters specifically
     is_imax = "imax" in theatre_filter.lower()
 
-    # Apply 35-day window for IMAX, otherwise restrict to 7 days for normal theaters
+    # Cap at 14 days maximum to stay below BMS request rate-limits per execution
     if is_imax:
-        dates = all_dates  # Up to 35 days
-        print("🎬 IMAX detected in BMS_THEATRE! Scanning full 35-day window.")
+        dates = all_dates[:14]
+        print("🎬 IMAX detected in BMS_THEATRE! Scanning 14-day window.")
     else:
-        dates = all_dates[:7]  # Restrict to first 7 days
+        dates = all_dates[:7]
         print("🎟️ Standard theater mode. Scanning 7-day window.")
 
     event_code, region_code = parse_bms_url(bms_url)
@@ -216,7 +226,6 @@ def main():
 
     current_state = {show["id"]: show for show in current_shows}
     
-    # Identify new showtimes or updates
     changes = []
     for show_id, show in current_state.items():
         if show_id not in previous_state:
@@ -224,10 +233,8 @@ def main():
         elif previous_state[show_id]["status"] != show["status"]:
             changes.append(f"<b>STATUS CHANGE:</b> {show['venue']} - {show['time']} [{show['date']}] -> {show['status']}")
 
-    # Save updated state
     save_state(current_state)
 
-    # Dispatch Telegram Notifications
     if current_shows:
         venues_summary = {}
         for show in current_shows:
