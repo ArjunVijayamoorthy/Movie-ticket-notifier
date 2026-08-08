@@ -2,7 +2,6 @@ name: BMS Ticket Checker
 
 on:
   schedule:
-    # Runs every hour at the top of the hour
     - cron: '0 * * * *'
   workflow_dispatch:
 
@@ -27,8 +26,8 @@ jobs:
       - name: Generate Dynamic Dates
         run: |
           DATES=()
-          # Checks today + next 6 days (7 days total)
-          for i in {0..6}; do
+          # Generates up to 35 days for IMAX checks
+          for i in {0..34}; do
             DATES+=($(TZ='Asia/Kolkata' date -d "+$i days" +%Y%m%d))
           done
           echo "BMS_DATES=$(IFS=,; echo "${DATES[*]}")" >> $GITHUB_ENV
