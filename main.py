@@ -1,57 +1,292 @@
-name: BMS Ticket Checker
+# /// script
+# dependencies = [
+#     "playwright",
+#     "requests",
+# ]
+# ///
 
-on:
-  schedule:
-    - cron: '0 * * * *'
-  workflow_dispatch:
+import json
+import os
+import re
+import time
+from datetime import datetime
+import requests
+from playwright.sync_api import sync_playwright
 
-permissions:
-  contents: write
+# ==========================================
+# 1. HELPER FUNCTIONS FOR NOTIFICATIONS
+# ==========================================
 
-jobs:
-  check-tickets:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v5
+def send_telegram_notification(text: str):
+    """Sends HTML formatted notifications to your Telegram chat."""
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
+    if not bot_token or not chat_id:
+        print("⚠️ Telegram secrets missing. Skipping Telegram notification.")
+        return
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version-file: ".python-version"
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
 
-      - name: Install Playwright Browsers
-        run: |
-          uv pip install playwright
-          uv run playwright install --with-deps chromium
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        if response.status_code == 200:
+            print("⚡ Telegram alert sent successfully!")
+        else:
+            print(f"❌ Telegram API Error: {response.status_code} {response.text}")
+    except Exception as e:
+        print(f"❌ Failed to send Telegram notification: {e}")
 
-      - name: Generate Dynamic Dates
-        run: |
-          DATES=()
-          for i in {0..34}; do
-            DATES+=($(TZ='Asia/Kolkata' date -d "+$i days" +%Y%m%d))
-          done
-          echo "BMS_DATES=$(IFS=,; echo "${DATES[*]}")" >> $GITHUB_ENV
 
-      - name: Run Ticket Check
-        env:
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          RESEND_FROM_EMAIL: ${{ secrets.RESEND_FROM_EMAIL }}
-          RESEND_TO_EMAIL: ${{ secrets.RESEND_TO_EMAIL }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          BMS_URL: ${{ vars.BMS_URL }}
-          BMS_THEATRE: ${{ vars.BMS_THEATRE }}
-          BMS_TIME: ${{ vars.BMS_TIME }}
-        run: uv run main.py
+# ==========================================
+# 2. BOOKMYSHOW DATA SCRAPING & PARSING
+# ==========================================
 
-      - name: Commit State Changes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add bms_state.json
-          git commit -m "Update BMS state [skip ci]" || exit 0
-          git push
+def parse_bms_url(url: str):
+    """Extracts Event Code and Region Code from the BMS URL."""
+    match_event = re.search(r'(ET\d+)', url)
+    event_code = match_event.group(1) if match_event else None
+
+    region_code = "CHEN"  # Default to Chennai
+    parts = url.lower().split('/')
+    if "movies" in parts:
+        idx = parts.index("movies")
+        if idx + 1 < len(parts):
+            extracted = parts[idx + 1].upper()
+            city_map = {
+                "CHENNAI": "CHEN",
+                "BANGALORE": "BANG",
+                "BENGALURU": "BANG",
+                "MUMBAI": "MUMB",
+                "DELHI-NCR": "NCR",
+                "HYDERABAD": "HYD"
+            }
+            region_code = city_map.get(extracted, extracted[:4])
+
+    return event_code, region_code
+
+
+def fetch_showtimes_playwright(bms_url: str, event_code: str, region_code: str, dates: list, theatre_filter: str, time_filter: str):
+    """Uses Headless Chromium to pass Akamai challenges and fetch showtimes."""
+    all_shows = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled"
+            ]
+        )
+        
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720},
+            locale="en-US"
+        )
+
+        page = context.new_page()
+
+        print("🌐 Opening BookMyShow in Playwright Browser to resolve WAF challenges...")
+        try:
+            page.goto(bms_url, wait_until="domcontentloaded", timeout=30000)
+            time.sleep(3)  # Allow Akamai scripts to initialize tokens
+            print("✅ Browser session initialized.")
+        except Exception as e:
+            print(f"⚠️ Page navigation warning: {e}")
+
+        for idx, date_str in enumerate(dates):
+            if not date_str:
+                continue
+
+            if idx > 0:
+                time.sleep(1.5)
+
+            api_url = f"https://in.bookmyshow.com/serv/getData?cmd=GETSHOWTIMESBYEVENTANDDATE&f=json&dc={date_str}&vc={region_code}&eid={event_code}"
+
+            try:
+                # Execute fetch inside the authenticated browser context
+                response_text = page.evaluate(f"""
+                    async () => {{
+                        const res = await fetch("{api_url}", {{
+                            headers: {{
+                                "Accept": "application/json, text/plain, */*",
+                                "X-Requested-With": "XMLHttpRequest"
+                            }}
+                        }});
+                        return await res.text();
+                    }}
+                """)
+
+                raw_response = response_text.strip()
+
+                if not (raw_response.startswith("{") or raw_response.startswith("[")):
+                    print(f"⚠️ [{date_str}]: Non-JSON response returned.")
+                    continue
+
+                data = json.loads(raw_response)
+
+                venues = []
+                if isinstance(data, dict):
+                    if "BookMyShow" in data and "arrVenue" in data["BookMyShow"]:
+                        venues = data["BookMyShow"]["arrVenue"]
+                    elif "arrVenue" in data:
+                        venues = data["arrVenue"]
+
+                print(f"DEBUG [{date_str}]: Retrieved {len(venues)} venues from BMS API.")
+
+                for venue in venues:
+                    venue_name = venue.get("VenueName", "")
+
+                    if theatre_filter and not any(t.strip().lower() in venue_name.lower() for t in theatre_filter.split(',')):
+                        continue
+
+                    for show in venue.get("ShowTimes", []):
+                        show_time = show.get("ShowTime", "")
+
+                        if time_filter:
+                            hour = int(show.get("ShowTimeCode", "0")[:2]) if show.get("ShowTimeCode") else 12
+                            match_time = False
+                            for t_cond in time_filter.split(','):
+                                t_cond = t_cond.strip().lower()
+                                if t_cond == "morning" and 6 <= hour < 12: match_time = True
+                                elif t_cond == "afternoon" and 12 <= hour < 16: match_time = True
+                                elif t_cond == "evening" and 16 <= hour < 19: match_time = True
+                                elif t_cond == "night" and (19 <= hour <= 24 or hour < 6): match_time = True
+                            if not match_time:
+                                continue
+
+                        categories = [cat.get("Price", "") for cat in show.get("Categories", [])]
+                        price_info = f"₹{categories[0]}" if categories else ""
+
+                        all_shows.append({
+                            "id": f"{venue_name}_{date_str}_{show_time}",
+                            "venue": venue_name,
+                            "date": date_str,
+                            "time": show_time,
+                            "price": price_info,
+                            "status": show.get("ShowBookingOptions", "Available")
+                        })
+
+            except Exception as e:
+                print(f"❌ Exception on date {date_str}: {e}")
+
+        browser.close()
+
+    return all_shows
+
+
+# ==========================================
+# 3. STATE MANAGEMENT & MAIN LOGIC
+# ==========================================
+
+def load_state(filename="bms_state.json"):
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_state(state, filename="bms_state.json"):
+    with open(filename, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def main():
+    bms_url = os.getenv("BMS_URL")
+    if not bms_url:
+        print("❌ BMS_URL variable missing. Exiting.")
+        return
+
+    dates_var = os.getenv("BMS_DATES", "")
+    all_dates = [d.strip() for d in dates_var.split(",") if d.strip()]
+
+    theatre_filter = os.getenv("BMS_THEATRE", "").strip()
+    time_filter = os.getenv("BMS_TIME", "").strip()
+
+    is_imax = "imax" in theatre_filter.lower()
+
+    if is_imax:
+        dates = all_dates[:14]
+        print("🎬 IMAX detected in BMS_THEATRE! Scanning 14-day window.")
+    else:
+        dates = all_dates[:7]
+        print("🎟️ Standard theater mode. Scanning 7-day window.")
+
+    event_code, region_code = parse_bms_url(bms_url)
+
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] BMS Ticket Checker")
+    print(f"URL: {bms_url}")
+    print(f"Extracted Event Code: {event_code} | Region Code: {region_code}")
+    print(f"Monitoring Dates Count: {len(dates)} dates ({dates[0]} to {dates[-1]})")
+    print(f"Filters -> Theatre: '{theatre_filter}' | Time: '{time_filter}'")
+
+    current_shows = fetch_showtimes_playwright(bms_url, event_code, region_code, dates, theatre_filter, time_filter)
+    previous_state = load_state()
+
+    current_state = {show["id"]: show for show in current_shows}
+
+    changes = []
+    for show_id, show in current_state.items():
+        if show_id not in previous_state:
+            changes.append(f"<b>NEW:</b> {show['venue']} - {show['time']} [{show['date']}] ({show['price']})")
+        elif previous_state[show_id]["status"] != show["status"]:
+            changes.append(f"<b>STATUS CHANGE:</b> {show['venue']} - {show['time']} [{show['date']}] -> {show['status']}")
+
+    save_state(current_state)
+
+    if current_shows:
+        venues_summary = {}
+        for show in current_shows:
+            venue = show["venue"]
+            time_str = f"{show['time']} ({show['date']})"
+            if venue not in venues_summary:
+                venues_summary[venue] = []
+            venues_summary[venue].append(time_str)
+
+        theatre_details = []
+        for venue_name, times in venues_summary.items():
+            theatre_details.append(f"🏛️ <b>{venue_name}</b>\n   🕒 {', '.join(times)}")
+
+        shows_text_block = "\n\n".join(theatre_details)
+
+        if changes:
+            message_lines = [
+                "<b>🎟️ BOOKMYSHOW ALERT: NEW SHOWS DETECTED!</b>\n",
+                f"<b>Movie Code:</b> {event_code}",
+                f"<b>Total Shows Found:</b> {len(current_shows)}\n",
+                "<b>Available Theatres & Timings:</b>\n",
+                shows_text_block,
+                f"\n🔗 <a href='{bms_url}'>Book on BookMyShow</a>"
+            ]
+            send_telegram_notification("\n".join(message_lines))
+        else:
+            message_lines = [
+                "<b>ℹ️ BMS Hourly Status Check: Active Shows</b>\n",
+                f"<b>Movie Code:</b> {event_code}",
+                f"<b>Total Shows Found:</b> {len(current_shows)}\n",
+                "<b>Theatres & Timings:</b>\n",
+                shows_text_block,
+                f"\n🔗 <a href='{bms_url}'>Book on BookMyShow</a>"
+            ]
+            send_telegram_notification("\n".join(message_lines))
+    else:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] No showtimes available for monitored dates. Telegram alert skipped.")
+
+
+if __name__ == "__main__":
+    main()
