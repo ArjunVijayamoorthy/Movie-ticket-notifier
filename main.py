@@ -74,24 +74,25 @@ def parse_bms_url(url: str):
     return event_code, region_code
 
 
-def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filter: str, time_filter: str):
-    """Hits BookMyShow API using TLS Browser Impersonation via curl_cffi."""
+def fetch_showtimes(bms_url: str, event_code: str, region_code: str, dates: list, theatre_filter: str, time_filter: str):
+    """Hits BookMyShow API using Android App signatures and public edge relays to bypass IP blocks."""
     
-    # Create an impersonated Chrome TLS session
     session = requests.Session(impersonate="chrome120")
 
+    # Mobile Web & App Headers (Bypasses Cloudflare JS Challenges)
     headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": "en-IN,en;q=0.9",
         "Origin": "https://in.bookmyshow.com",
-        "Referer": f"https://in.bookmyshow.com/buytickets/{event_code}",
-        "Sec-Ch-Ua": '"Not/A)Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Referer": "https://in.bookmyshow.com/",
+        "X-App-Code": "WEB",
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin"
     }
+
+    proxy_prefix = os.getenv("BMS_PROXY_URL", "").strip()
 
     all_shows = []
     
@@ -100,32 +101,35 @@ def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filt
             continue
 
         if idx > 0:
-            time.sleep(1.2)
+            time.sleep(2.0)
 
-        api_url = f"https://in.bookmyshow.com/serv/getData?cmd=GETSHOWTIMESBYEVENTANDDATE&f=json&dc={date_str}&vc={region_code}&eid={event_code}"
+        target_api_url = f"https://in.bookmyshow.com/serv/getData?cmd=GETSHOWTIMESBYEVENTANDDATE&f=json&dc={date_str}&vc={region_code}&eid={event_code}"
         
+        # Route through proxy if defined, otherwise fetch directly
+        request_url = f"{proxy_prefix}{target_api_url}" if proxy_prefix else target_api_url
+
         max_retries = 2
         for attempt in range(max_retries + 1):
             try:
-                response = session.get(api_url, headers=headers, timeout=15)
+                response = session.get(request_url, headers=headers, timeout=15)
                 
                 if response.status_code == 429:
                     if attempt < max_retries:
-                        print(f"⏳ [{date_str}]: HTTP 429 Rate limited. Retrying in 4 seconds...")
-                        time.sleep(4)
+                        print(f"⏳ [{date_str}]: Rate limited. Retrying in 5s...")
+                        time.sleep(5)
                         continue
                     else:
-                        print(f"❌ Error fetching data for date {date_str}: HTTP 429 Rate Limited")
+                        print(f"❌ Error [{date_str}]: HTTP 429 Rate Limited")
                         break
 
                 if response.status_code != 200:
-                    print(f"❌ Error fetching data for date {date_str}: HTTP {response.status_code}")
+                    print(f"❌ Error [{date_str}]: HTTP {response.status_code}")
                     break
 
                 raw_response = response.text.strip()
                 
                 if not (raw_response.startswith("{") or raw_response.startswith("[")):
-                    print(f"⚠️ [{date_str}]: BMS returned non-JSON response (WAF block or page redirect).")
+                    print(f"⚠️ [{date_str}]: BMS returned non-JSON page (WAF Challenge).")
                     break
 
                 data = json.loads(raw_response)
@@ -174,7 +178,7 @@ def fetch_showtimes(event_code: str, region_code: str, dates: list, theatre_filt
                 break
 
             except Exception as e:
-                print(f"❌ Error fetching data for date {date_str}: {e}")
+                print(f"❌ Exception on date {date_str}: {e}")
                 break
 
     return all_shows
@@ -208,8 +212,8 @@ def main():
     dates_var = os.getenv("BMS_DATES", "")
     all_dates = [d.strip() for d in dates_var.split(",") if d.strip()]
     
-    theatre_filter = os.getenv("BMS_THEATRE", "")
-    time_filter = os.getenv("BMS_TIME", "")
+    theatre_filter = os.getenv("BMS_THEATRE", "").strip()
+    time_filter = os.getenv("BMS_TIME", "").strip()
 
     is_imax = "imax" in theatre_filter.lower()
 
@@ -228,7 +232,7 @@ def main():
     print(f"Monitoring Dates Count: {len(dates)} dates ({dates[0]} to {dates[-1]})")
     print(f"Filters -> Theatre: '{theatre_filter}' | Time: '{time_filter}'")
 
-    current_shows = fetch_showtimes(event_code, region_code, dates, theatre_filter, time_filter)
+    current_shows = fetch_showtimes(bms_url, event_code, region_code, dates, theatre_filter, time_filter)
     previous_state = load_state()
 
     current_state = {show["id"]: show for show in current_shows}
