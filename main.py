@@ -77,7 +77,7 @@ def parse_bms_url(url: str):
 
 
 def fetch_showtimes_playwright(bms_url: str, event_code: str, region_code: str, dates: list, theatre_filter: str, time_filter: str):
-    """Uses Headless Chromium to pass Akamai challenges and fetch showtimes."""
+    """Uses Headless Chromium with Playwright API Request Context to bypass WAF."""
     all_shows = []
 
     with sync_playwright() as p:
@@ -86,7 +86,8 @@ def fetch_showtimes_playwright(bms_url: str, event_code: str, region_code: str, 
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled"
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars"
             ]
         )
         
@@ -98,10 +99,13 @@ def fetch_showtimes_playwright(bms_url: str, event_code: str, region_code: str, 
 
         page = context.new_page()
 
-        print("🌐 Opening BookMyShow in Playwright Browser to resolve WAF challenges...")
+        # Stealth override to mask Playwright automation signature
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        print("🌐 Opening BookMyShow page to establish Akamai session tokens...")
         try:
             page.goto(bms_url, wait_until="domcontentloaded", timeout=30000)
-            time.sleep(3)  # Allow Akamai scripts to initialize tokens
+            time.sleep(3)  # Allow JS scripts to evaluate session tokens
             print("✅ Browser session initialized.")
         except Exception as e:
             print(f"⚠️ Page navigation warning: {e}")
@@ -116,23 +120,29 @@ def fetch_showtimes_playwright(bms_url: str, event_code: str, region_code: str, 
             api_url = f"https://in.bookmyshow.com/serv/getData?cmd=GETSHOWTIMESBYEVENTANDDATE&f=json&dc={date_str}&vc={region_code}&eid={event_code}"
 
             try:
-                # Execute fetch inside the authenticated browser context
-                response_text = page.evaluate(f"""
-                    async () => {{
-                        const res = await fetch("{api_url}", {{
-                            headers: {{
-                                "Accept": "application/json, text/plain, */*",
-                                "X-Requested-With": "XMLHttpRequest"
-                            }}
-                        }});
-                        return await res.text();
-                    }}
-                """)
+                # Use context.request to send API calls with session cookies
+                response = context.request.get(
+                    api_url,
+                    headers={
+                        "Accept": "application/json, text/plain, */*",
+                        "Referer": bms_url,
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Sec-Fetch-Dest": "empty",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Site": "same-origin"
+                    }
+                )
 
-                raw_response = response_text.strip()
+                status = response.status
+                raw_response = response.text().strip()
+
+                if status != 200:
+                    print(f"❌ [{date_str}]: HTTP {status}")
+                    continue
 
                 if not (raw_response.startswith("{") or raw_response.startswith("[")):
-                    print(f"⚠️ [{date_str}]: Non-JSON response returned.")
+                    preview = raw_response[:120].replace('\n', ' ')
+                    print(f"⚠️ [{date_str}]: Non-JSON (Status {status}): {preview}")
                     continue
 
                 data = json.loads(raw_response)
