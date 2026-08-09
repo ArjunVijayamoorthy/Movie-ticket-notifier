@@ -75,24 +75,23 @@ def parse_bms_url(url: str):
 
 
 def fetch_showtimes(bms_url: str, event_code: str, region_code: str, dates: list, theatre_filter: str, time_filter: str):
-    """Hits BookMyShow API using Android App signatures and public edge relays to bypass IP blocks."""
+    """Hits BookMyShow API via Cloudflare Worker proxy."""
     
     session = requests.Session(impersonate="chrome120")
 
-    # Mobile Web & App Headers (Bypasses Cloudflare JS Challenges)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-IN,en;q=0.9",
-        "Origin": "https://in.bookmyshow.com",
-        "Referer": "https://in.bookmyshow.com/",
-        "X-App-Code": "WEB",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin"
-    }
-
     proxy_prefix = os.getenv("BMS_PROXY_URL", "").strip()
+    if proxy_prefix:
+        print(f"🌐 Routing requests via Cloudflare Proxy: {proxy_prefix}")
+    else:
+        print("⚠️ BMS_PROXY_URL not set! Making direct requests (may be blocked by WAF).")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://in.bookmyshow.com",
+        "Referer": "https://in.bookmyshow.com/"
+    }
 
     all_shows = []
     
@@ -101,11 +100,9 @@ def fetch_showtimes(bms_url: str, event_code: str, region_code: str, dates: list
             continue
 
         if idx > 0:
-            time.sleep(2.0)
+            time.sleep(1.5)
 
         target_api_url = f"https://in.bookmyshow.com/serv/getData?cmd=GETSHOWTIMESBYEVENTANDDATE&f=json&dc={date_str}&vc={region_code}&eid={event_code}"
-        
-        # Route through proxy if defined, otherwise fetch directly
         request_url = f"{proxy_prefix}{target_api_url}" if proxy_prefix else target_api_url
 
         max_retries = 2
@@ -129,7 +126,7 @@ def fetch_showtimes(bms_url: str, event_code: str, region_code: str, dates: list
                 raw_response = response.text.strip()
                 
                 if not (raw_response.startswith("{") or raw_response.startswith("[")):
-                    print(f"⚠️ [{date_str}]: BMS returned non-JSON page (WAF Challenge).")
+                    print(f"⚠️ [{date_str}]: BMS returned non-JSON response (WAF Challenge or 0 shows).")
                     break
 
                 data = json.loads(raw_response)
