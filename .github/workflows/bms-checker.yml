@@ -25,7 +25,6 @@ jobs:
 
       - name: Install Playwright Browsers
         run: |
-          uv pip install playwright
           uv run playwright install --with-deps chromium
 
       - name: Generate Dynamic Dates
