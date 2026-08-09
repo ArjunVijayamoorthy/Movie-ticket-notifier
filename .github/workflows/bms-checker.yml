@@ -26,7 +26,6 @@ jobs:
       - name: Generate Dynamic Dates
         run: |
           DATES=()
-          # Generates up to 35 days for IMAX checks
           for i in {0..34}; do
             DATES+=($(TZ='Asia/Kolkata' date -d "+$i days" +%Y%m%d))
           done
@@ -42,6 +41,7 @@ jobs:
           BMS_URL: ${{ vars.BMS_URL }}
           BMS_THEATRE: ${{ vars.BMS_THEATRE }}
           BMS_TIME: ${{ vars.BMS_TIME }}
+          BMS_PROXY_URL: ${{ vars.BMS_PROXY_URL }}
         run: uv run main.py
 
       - name: Commit State Changes
